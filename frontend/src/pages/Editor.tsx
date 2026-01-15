@@ -79,6 +79,7 @@ export const Editor: React.FC = () => {
   const animationFrameId = useRef<number>(0);
   const latestElementsRef = useRef<readonly any[]>([]);
   const latestFilesRef = useRef<any>(null);
+  const lastSyncedFilesRef = useRef<Record<string, any>>({});
 
   const recordElementVersion = useCallback((element: any) => {
     elementVersionMap.current.set(element.id, {
@@ -101,6 +102,14 @@ export const Editor: React.FC = () => {
     isUnmounting.current = false;
     return () => {
       isUnmounting.current = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (import.meta.env.DEV) {
+        (window as any).__EXCALIDRAW_API__ = null;
+      }
     };
   }, []);
 
@@ -164,7 +173,7 @@ export const Editor: React.FC = () => {
        });
     });
 
-    socket.on('element-update', ({ elements }: { elements: any[] }) => {
+    socket.on('element-update', ({ elements, files }: { elements: any[]; files?: Record<string, any> }) => {
       if (!excalidrawAPI.current) return;
       
       isSyncing.current = true;
@@ -180,14 +189,20 @@ export const Editor: React.FC = () => {
 
       const localElements = excalidrawAPI.current.getSceneElementsIncludingDeleted();
       const mergedElements = reconcileElements(localElements, validRemoteElements);
+      const localFiles = excalidrawAPI.current.getFiles?.() || latestFilesRef.current || {};
+      const mergedFiles = files ? { ...localFiles, ...files } : localFiles;
       
       // Update version map with remote versions to avoid echoing
       validRemoteElements.forEach((el: any) => {
         recordElementVersion(el);
       });
       
-      excalidrawAPI.current.updateScene({ elements: mergedElements });
+      excalidrawAPI.current.updateScene({ elements: mergedElements, files: mergedFiles });
       latestElementsRef.current = mergedElements;
+      latestFilesRef.current = mergedFiles;
+      if (files && Object.keys(files).length > 0) {
+        lastSyncedFilesRef.current = { ...lastSyncedFilesRef.current, ...files };
+      }
       isSyncing.current = false;
     });
 
@@ -239,6 +254,9 @@ export const Editor: React.FC = () => {
   
   const setExcalidrawAPI = useCallback((api: any) => {
     excalidrawAPI.current = api;
+    if (import.meta.env.DEV) {
+      (window as any).__EXCALIDRAW_API__ = api;
+    }
     setIsReady(true);
   }, []);
 
@@ -421,6 +439,25 @@ export const Editor: React.FC = () => {
     []
   );
 
+  const collectNewFiles = useCallback((files: Record<string, any>, known: Record<string, any>) => {
+    if (!files) return {};
+    const delta: Record<string, any> = {};
+    Object.entries(files).forEach(([fileId, file]) => {
+      const previous = known?.[fileId];
+      const prevData = previous?.dataURL ?? previous?.data;
+      const nextData = file?.dataURL ?? file?.data;
+      const changed = !previous
+        || previous?.mimeType !== file?.mimeType
+        || previous?.created !== file?.created
+        || prevData !== nextData;
+
+      if (changed) {
+        delta[fileId] = file;
+      }
+    });
+    return delta;
+  }, []);
+
   const broadcastChanges = useCallback(
     throttle((elements: readonly any[]) => {
       if (!socketRef.current || !id) return;
@@ -434,15 +471,23 @@ export const Editor: React.FC = () => {
         }
       });
       
-      if (changes.length > 0) {
+      const latestFiles = latestFilesRef.current || {};
+      const newFiles = collectNewFiles(latestFiles, lastSyncedFilesRef.current);
+      const hasNewFiles = Object.keys(newFiles).length > 0;
+
+      if (changes.length > 0 || hasNewFiles) {
         socketRef.current.emit('element-update', {
           drawingId: id,
           elements: changes,
+          files: hasNewFiles ? newFiles : undefined,
           userId: me.id
         });
+        if (hasNewFiles) {
+          lastSyncedFilesRef.current = { ...lastSyncedFilesRef.current, ...newFiles };
+        }
       }
     }, 100, { leading: true, trailing: true }),
-    [id, hasElementChanged, recordElementVersion]
+    [id, hasElementChanged, recordElementVersion, collectNewFiles]
   );
 
   // ------------------------------------------------------------------
@@ -454,6 +499,7 @@ export const Editor: React.FC = () => {
     elementVersionMap.current.clear();
     latestElementsRef.current = [];
     latestFilesRef.current = {};
+    lastSyncedFilesRef.current = {};
     excalidrawAPI.current = null;
     setIsReady(false);
     setIsSceneLoading(true);
@@ -481,6 +527,7 @@ export const Editor: React.FC = () => {
         const files = data.files || {};
         latestElementsRef.current = elements;
         latestFilesRef.current = files;
+        lastSyncedFilesRef.current = files;
         
         elements.forEach((el: any) => {
           recordElementVersion(el);
