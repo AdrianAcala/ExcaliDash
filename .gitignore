@@ -1,9 +1,15 @@
 # Dependencies
 frontend/node_modules
 backend/node_modules
+e2e/node_modules
 
 # Database
+*.db
+*.db-journal
+*.db.backup
 backend/prisma/*.db
+backend/prisma/*.db-journal
+backend/prisma/*.db.backup
 backend/prisma/dev.db
 
 # Generated files
@@ -19,6 +25,13 @@ backend/src/generated/
 frontend/dist/
 frontend/build/
 backend/dist/
+
+# User uploads
+backend/uploads/
+
+# E2E test artifacts
+e2e/playwright-report/
+e2e/test-results/
 
 # Logs
 *.log
@@ -74,3 +87,11 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+.cache/
+*.cache
+
+# Docker volumes (if using named volumes)
+docker-volumes/
+
+# Local development files
+.local
