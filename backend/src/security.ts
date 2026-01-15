@@ -440,15 +440,36 @@ export const sanitizeDrawingData = (data: {
     // Sanitize files object
     let sanitizedFiles = data.files;
     if (typeof sanitizedFiles === "object" && sanitizedFiles !== null) {
-      // Recursively sanitize any string values in files
-      sanitizedFiles = JSON.parse(
-        JSON.stringify(sanitizedFiles, (key, value) => {
-          if (typeof value === "string") {
-            return sanitizeText(value, 10000);
+      // Sanitize files while preserving dataURL content
+      // dataURL fields contain base64-encoded binary data and can be very large (MBs)
+      // We validate their format but don't truncate them
+      const sanitizedFilesObj: Record<string, any> = {};
+      for (const [fileId, file] of Object.entries(sanitizedFiles)) {
+        if (typeof file !== "object" || file === null) continue;
+        
+        const sanitizedFile: Record<string, any> = {};
+        for (const [key, value] of Object.entries(file as Record<string, any>)) {
+          if (key === "dataURL" && typeof value === "string") {
+            // Validate dataURL format: must start with data: and contain base64 or charset
+            // Don't truncate - images can be very large
+            if (/^data:[a-zA-Z0-9+/.-]+;(base64|charset=[^,]+),/.test(value)) {
+              sanitizedFile[key] = value;
+            } else {
+              // Invalid dataURL format - skip this file
+              console.warn(`Invalid dataURL format for file ${fileId}`);
+              sanitizedFile[key] = "";
+            }
+          } else if (typeof value === "string") {
+            // Sanitize other string fields normally
+            sanitizedFile[key] = sanitizeText(value, 10000);
+          } else {
+            // Pass through non-string values
+            sanitizedFile[key] = value;
           }
-          return value;
-        })
-      );
+        }
+        sanitizedFilesObj[fileId] = sanitizedFile;
+      }
+      sanitizedFiles = sanitizedFilesObj;
     }
 
     return {

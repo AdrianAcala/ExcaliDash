@@ -80,6 +80,7 @@ export const Editor: React.FC = () => {
   const latestElementsRef = useRef<readonly any[]>([]);
   const latestFilesRef = useRef<any>(null);
   const lastSyncedFilesRef = useRef<Record<string, any>>({});
+  const isFetchingMissingFilesRef = useRef(false);
 
   const recordElementVersion = useCallback((element: any) => {
     elementVersionMap.current.set(element.id, {
@@ -96,6 +97,27 @@ export const Editor: React.FC = () => {
     const nextNonce = element.versionNonce ?? 0;
 
     return previous.version !== nextVersion || previous.versionNonce !== nextNonce;
+  }, []);
+
+  const buildFileSignatures = useCallback((files: Record<string, any>) => {
+    const signatures: Record<string, any> = {};
+    if (!files) return signatures;
+
+    Object.entries(files).forEach(([fileId, file]) => {
+      if (!file) return;
+      signatures[fileId] = {
+        mimeType: file?.mimeType,
+        created: file?.created,
+        dataURL: typeof file?.dataURL === "string" ? file.dataURL : undefined,
+        data: typeof file?.data === "string" ? file.data : undefined,
+      };
+    });
+
+    return signatures;
+  }, []);
+
+  const releaseSyncLock = useCallback(() => {
+    isSyncing.current = false;
   }, []);
 
   useEffect(() => {
@@ -197,13 +219,75 @@ export const Editor: React.FC = () => {
         recordElementVersion(el);
       });
       
+      if (files && Object.keys(files).length > 0) {
+        excalidrawAPI.current.addFiles?.(Object.values(files));
+      }
       excalidrawAPI.current.updateScene({ elements: mergedElements, files: mergedFiles });
       latestElementsRef.current = mergedElements;
       latestFilesRef.current = mergedFiles;
       if (files && Object.keys(files).length > 0) {
-        lastSyncedFilesRef.current = { ...lastSyncedFilesRef.current, ...files };
+        lastSyncedFilesRef.current = {
+          ...lastSyncedFilesRef.current,
+          ...buildFileSignatures(files),
+        };
       }
-      isSyncing.current = false;
+
+      const missingFileIds = mergedElements
+        .filter((el: any) => el?.type === 'image' && el?.fileId)
+        .map((el: any) => el.fileId as string)
+        .filter((fileId: string) => {
+          const file = mergedFiles[fileId];
+          return !file || (!file?.dataURL && !file?.data);
+        });
+
+
+      if (missingFileIds.length > 0 && id && !isFetchingMissingFilesRef.current) {
+        isFetchingMissingFilesRef.current = true;
+
+        const retryFetchMissingFiles = (pendingIds: string[], attempt: number) => {
+          api.getDrawing(id)
+            .then((data) => {
+              const fetchedFiles = data.files || {};
+              if (!excalidrawAPI.current) return;
+
+              const elementsSnapshot = latestElementsRef.current.length > 0
+                ? latestElementsRef.current
+                : mergedElements;
+              const filledFiles = { ...latestFilesRef.current, ...fetchedFiles };
+              const stillMissing = pendingIds.filter((fileId) => {
+                const file = filledFiles[fileId];
+                return !file || (!file?.dataURL && !file?.data);
+              });
+
+
+              if (Object.keys(fetchedFiles).length > 0) {
+                isSyncing.current = true;
+                excalidrawAPI.current.addFiles?.(Object.values(fetchedFiles));
+                excalidrawAPI.current.updateScene({ elements: elementsSnapshot, files: filledFiles });
+                latestFilesRef.current = filledFiles;
+                lastSyncedFilesRef.current = {
+                  ...lastSyncedFilesRef.current,
+                  ...buildFileSignatures(fetchedFiles),
+                };
+                releaseSyncLock();
+              }
+
+              if (stillMissing.length > 0 && attempt < 4) {
+                const delay = 500 * Math.pow(2, attempt);
+                setTimeout(() => retryFetchMissingFiles(stillMissing, attempt + 1), delay);
+              } else {
+                isFetchingMissingFilesRef.current = false;
+              }
+            })
+            .catch((err) => {
+              console.warn('[Editor] Failed to fetch missing files', err);
+              isFetchingMissingFilesRef.current = false;
+            });
+        };
+
+        retryFetchMissingFiles(missingFileIds, 0);
+      }
+      releaseSyncLock();
     });
 
     // Activity Tracking
@@ -232,7 +316,7 @@ export const Editor: React.FC = () => {
       socket.disconnect();
       cancelAnimationFrame(animationFrameId.current);
     };
-  }, [id, me, isReady, recordElementVersion]);
+  }, [id, me, isReady, recordElementVersion, buildFileSignatures, releaseSyncLock]);
 
   const onPointerUpdate = useCallback((payload: any) => {
     const now = Date.now();
@@ -354,10 +438,17 @@ export const Editor: React.FC = () => {
         appState: persistableAppState,
       });
 
+      const filesSnapshot = latestFilesRef.current || {};
+      const hasMissingFileData = persistableElements.some((el: any) => {
+        if (el?.type !== "image" || !el?.fileId) return false;
+        const file = filesSnapshot[el.fileId];
+        return !file || (!file?.dataURL && !file?.data);
+      });
+
       await api.updateDrawing(id, {
         elements: persistableElements,
         appState: persistableAppState,
-        files: latestFilesRef.current || {},
+        ...(hasMissingFileData ? {} : { files: filesSnapshot }),
       });
 
       console.log("[Editor] Save complete", { drawingId: id });
@@ -458,10 +549,26 @@ export const Editor: React.FC = () => {
     return delta;
   }, []);
 
+  const emitFileDelta = useCallback((filesDelta: Record<string, any>) => {
+    if (!socketRef.current || !id) return;
+    if (!filesDelta || Object.keys(filesDelta).length === 0) return;
+
+    socketRef.current.emit('element-update', {
+      drawingId: id,
+      elements: [],
+      files: filesDelta,
+      userId: me.id,
+    });
+    lastSyncedFilesRef.current = {
+      ...lastSyncedFilesRef.current,
+      ...buildFileSignatures(filesDelta),
+    };
+  }, [buildFileSignatures, id, me.id]);
+
   const broadcastChanges = useCallback(
     throttle((elements: readonly any[]) => {
       if (!socketRef.current || !id) return;
-      
+
       const changes: any[] = [];
 
       elements.forEach((el) => {
@@ -470,24 +577,16 @@ export const Editor: React.FC = () => {
           recordElementVersion(el);
         }
       });
-      
-      const latestFiles = latestFilesRef.current || {};
-      const newFiles = collectNewFiles(latestFiles, lastSyncedFilesRef.current);
-      const hasNewFiles = Object.keys(newFiles).length > 0;
 
-      if (changes.length > 0 || hasNewFiles) {
+      if (changes.length > 0) {
         socketRef.current.emit('element-update', {
           drawingId: id,
           elements: changes,
-          files: hasNewFiles ? newFiles : undefined,
-          userId: me.id
+          userId: me.id,
         });
-        if (hasNewFiles) {
-          lastSyncedFilesRef.current = { ...lastSyncedFilesRef.current, ...newFiles };
-        }
       }
     }, 100, { leading: true, trailing: true }),
-    [id, hasElementChanged, recordElementVersion, collectNewFiles]
+    [id, hasElementChanged, recordElementVersion, me.id]
   );
 
   // ------------------------------------------------------------------
@@ -527,7 +626,7 @@ export const Editor: React.FC = () => {
         const files = data.files || {};
         latestElementsRef.current = elements;
         latestFilesRef.current = files;
-        lastSyncedFilesRef.current = files;
+        lastSyncedFilesRef.current = buildFileSignatures(files);
         
         elements.forEach((el: any) => {
           recordElementVersion(el);
@@ -559,7 +658,7 @@ export const Editor: React.FC = () => {
       }
     };
     loadData();
-  }, [id, recordElementVersion, buildEmptyScene]);
+  }, [id, recordElementVersion, buildEmptyScene, buildFileSignatures]);
 
   // ------------------------------------------------------------------
   // 3. HANDLERS
@@ -588,7 +687,7 @@ export const Editor: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const handleCanvasChange = useCallback((elements: readonly any[], appState: any) => {
+  const handleCanvasChange = useCallback((elements: readonly any[], appState: any, filesFromScene?: Record<string, any>) => {
     if (isUnmounting.current) {
       console.log("[Editor] Ignoring change during unmount", { drawingId: id });
       return;
@@ -624,6 +723,10 @@ export const Editor: React.FC = () => {
 
     latestElementsRef.current = allElements;
 
+    const files = filesFromScene ?? (excalidrawAPI.current?.getFiles() || {});
+    latestFilesRef.current = files;
+    emitFileDelta(collectNewFiles(files, lastSyncedFilesRef.current));
+
     const hasRenderableElements = allElements.some((el: any) => !el?.isDeleted);
     if (isBootstrappingScene.current && !hasRenderableElements) {
       console.log("[Editor] Bootstrapping guard active", {
@@ -645,14 +748,12 @@ export const Editor: React.FC = () => {
     debouncedSave(allElements, appState);
 
     // Trigger Slow Preview Gen
-    const files = excalidrawAPI.current?.getFiles() || {};
-    latestFilesRef.current = files;
     console.log("[Editor] Queueing preview save", {
       drawingId: id,
       fileCount: Object.keys(files).length,
     });
     debouncedSavePreview(allElements, appState, files);
-  }, [debouncedSave, debouncedSavePreview, broadcastChanges]);
+  }, [debouncedSave, debouncedSavePreview, broadcastChanges, collectNewFiles, emitFileDelta]);
 
   const handleRenameSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
